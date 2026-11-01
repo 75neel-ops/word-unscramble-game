@@ -1,89 +1,59 @@
 """
-Word Scramble Game
-------------------
+Word Scramble Game - Streamlit version
+--------------------------------------
 - Difficulty: easy / hard / tough
 - Word length: 3, 4, 5 or 6 letters
-- Words come from the online Datamuse word list and are verified
-  against the Free Dictionary API (dictionaryapi.dev). If that service is
-  down, Datamuse's own definitions are used instead.
-- Hints: dictionary definition (easy/hard); a Gemini-written clue (tough).
+- Words come from the online Datamuse word list and are verified against the
+  Free Dictionary API (dictionaryapi.dev); Datamuse definitions are the backup.
+- Hints: dictionary meaning (easy/hard); Gemini-written clue (tough).
 
-Setup:
-    pip install requests python-dotenv
-    Put GEMINI_API_KEY=your_key in a file named .env next to this script
-    (or set it as an environment variable).
-
-Run:
-    python word_scramble.py
+Gemini key: in Streamlit Cloud open  App -> Settings -> Secrets  and add
+    GEMINI_API_KEY = "your_key_here"
 """
 
 import os
 import random
 import re
-import sys
 
 import requests
+import streamlit as st
 
-# Make sure symbols print correctly on Windows consoles.
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+st.set_page_config(page_title="Word Scramble", page_icon="🔤")
 
-# Optional: read the key from a .env file if python-dotenv is installed.
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except ImportError:
-    pass
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash"  # change if your key supports a different model
-
-# Difficulty rules
-DIFFICULTY = {
-    "easy": {
-        "tries": 3,
-        "keep_first_letter": True,
-        "desc": "First letter stays in place, 3 tries, hint = dictionary meaning",
-    },
-    "hard": {
-        "tries": 2,
-        "keep_first_letter": False,
-        "desc": "Fully scrambled, 2 tries, hint = dictionary meaning",
-    },
-    "tough": {
-        "tries": 1,
-        "keep_first_letter": False,
-        "desc": "Fully scrambled, only 1 try, hint = a tricky clue from Gemini",
-    },
-}
-
 HEADERS = {"User-Agent": "word-scramble-game/1.0"}
 POS_NAMES = {"n": "noun", "v": "verb", "adj": "adjective", "adv": "adverb", "u": "word"}
 
-LAST_ERROR = ""  # most recent network problem, shown to the player
+DIFFICULTY = {
+    "easy": {"tries": 3, "keep_first": True,
+             "desc": "First letter stays in place, 3 tries, hint = dictionary meaning"},
+    "hard": {"tries": 2, "keep_first": False,
+             "desc": "Fully scrambled, 2 tries, hint = dictionary meaning"},
+    "tough": {"tries": 1, "keep_first": False,
+              "desc": "Fully scrambled, only 1 try, hint = tricky clue from Gemini"},
+}
 
 
 # ---------------------------------------------------------------- online data
-def fetch_candidate_words(length):
-    """Get common words of the given length from the Datamuse API.
-
-    Returns a list of (word, fallback_info) where fallback_info is a
-    (part_of_speech, definition) tuple from Datamuse, or None.
-    """
-    global LAST_ERROR
-    url = "https://api.datamuse.com/words"
-    params = {"sp": "?" * length, "max": 1000, "md": "fd"}
+def get_gemini_key():
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError) as e:
-        LAST_ERROR = f"{type(e).__name__}: {e}"
-        return []
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return os.getenv("GEMINI_API_KEY", "")
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_candidate_words(length):
+    """Common words of a given length from Datamuse (errors are raised, so they are not cached)."""
+    r = requests.get(
+        "https://api.datamuse.com/words",
+        params={"sp": "?" * length, "max": 1000, "md": "fd"},
+        headers=HEADERS,
+        timeout=10,
+    )
+    r.raise_for_status()
     words = []
-    for item in data:
+    for item in r.json():
         word = item.get("word", "")
         if not (word.isalpha() and word.islower() and len(word) == length):
             continue
@@ -94,69 +64,62 @@ def fetch_candidate_words(length):
                     freq = float(tag[2:])
                 except ValueError:
                     pass
-        if freq < 2.0:  # keep reasonably common words only
+        if freq < 2.0:
             continue
         fallback = None
         defs = item.get("defs") or []
         if defs:
-            pos_code, _, text = defs[0].partition("\t")
+            code, _, text = defs[0].partition("\t")
             if text:
-                fallback = (POS_NAMES.get(pos_code, "word"), text)
+                fallback = (POS_NAMES.get(code, "word"), text)
         words.append((word, fallback))
     return words
 
 
 def fetch_definition(word):
-    """Return (part_of_speech, definition) from the dictionary API, or None."""
-    url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=8)
+        r = requests.get(
+            f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}",
+            headers=HEADERS, timeout=8,
+        )
         if r.status_code != 200:
             return None
-        meanings = r.json()[0]["meanings"]
-        pos = meanings[0]["partOfSpeech"]
-        definition = meanings[0]["definitions"][0]["definition"]
-        return pos, definition
+        meaning = r.json()[0]["meanings"][0]
+        return meaning["partOfSpeech"], meaning["definitions"][0]["definition"]
     except (requests.RequestException, KeyError, IndexError, ValueError):
         return None
 
 
 def pick_word(length, used):
-    """Pick a random verified dictionary word we haven't used yet."""
     candidates = [c for c in fetch_candidate_words(length) if c[0] not in used]
     random.shuffle(candidates)
-
     dict_failures = 0
     for word, fallback in candidates[:25]:
         info = None
-        if dict_failures < 3:  # stop hammering the dictionary API if it is down
+        if dict_failures < 3:
             info = fetch_definition(word)
             if info is None:
                 dict_failures += 1
-        if info is None:
-            info = fallback
+        info = info or fallback
         if info:
             return word, info
     return None, None
 
 
 def gemini_clue(word, pos, definition):
-    """Ask Gemini for a tricky (but fair) clue that does not reveal the word."""
-    if not GEMINI_API_KEY:
+    key = get_gemini_key()
+    if not key:
         return None
     prompt = (
         f"Write ONE short, clever clue (max 20 words) for the word '{word}' "
-        f"({pos}; meaning: {definition}). Never include the word itself or "
-        f"any part of it. Return only the clue."
-    )
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
+        f"({pos}; meaning: {definition}). Never include the word itself or any "
+        f"part of it. Return only the clue."
     )
     try:
         r = requests.post(
-            url,
-            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
             json={"contents": [{"parts": [{"text": prompt}]}]},
             timeout=15,
         )
@@ -169,7 +132,6 @@ def gemini_clue(word, pos, definition):
 
 # ---------------------------------------------------------------- game logic
 def mask_word(text, word):
-    """Hide the answer if it appears inside a hint."""
     return re.sub(re.escape(word), "_" * len(word), text, flags=re.IGNORECASE)
 
 
@@ -184,111 +146,112 @@ def scramble(word, keep_first):
             result = letters[:]
             random.shuffle(result)
         if "".join(result) != word:
-            return "".join(result)
-    return "".join(result)  # very rare (e.g. words like "ooo")
-
-
-def ask_choice(prompt, options):
-    while True:
-        choice = input(prompt).strip().lower()
-        if choice in options:
-            return choice
-        print(f"  Please choose one of: {', '.join(options)}")
-
-
-def get_hint(word, level, pos, definition):
-    if level == "tough":
-        clue = gemini_clue(word, pos, definition)
-        if clue:
-            return clue
-        print("  (Gemini clue unavailable, using the dictionary meaning instead)")
-    return f"({pos}) {mask_word(definition, word)}"
-
-
-def play_round(length, level, used):
-    """Play one word. Returns True (won), False (lost) or None (no word found)."""
-    print("\nFetching a word from the online dictionary...")
-    word, info = pick_word(length, used)
-    if not word:
-        print("Could not get a word.")
-        if LAST_ERROR:
-            print(f"  Reason: {LAST_ERROR}")
-        print("  Check your internet connection and try again.")
-        return None
-    used.add(word)
-    pos, definition = info
-
-    rules = DIFFICULTY[level]
-    jumbled = scramble(word, rules["keep_first_letter"])
-    tries_left = rules["tries"]
-    hint_used = False
-
-    print(f"\nUnscramble this word:  {jumbled.upper()}   ({length} letters)")
-    print(f"Tries: {tries_left}   |   Type 'hint' for a hint\n")
-
-    while tries_left > 0:
-        guess = input("Your answer: ").strip().lower()
-
-        if guess == "hint":
-            if hint_used and level == "tough":
-                print("  Hint already used. Hint: " + get_hint(word, level, pos, definition))
-            else:
-                print("  Hint: " + get_hint(word, level, pos, definition))
-                hint_used = True
-            continue
-
-        if not guess:
-            continue
-
-        if guess == word:
-            print(f"\n*** Congratulations! '{word.upper()}' is correct! ***")
-            return True
-
-        tries_left -= 1
-        if tries_left > 0:
-            print(f"  Wrong answer. {tries_left} {'try' if tries_left == 1 else 'tries'} left.")
-
-    print(f"\nYour answer is wrong. The right answer is: {word.upper()}")
-    print(f"   Meaning: ({pos}) {definition}")
-    return False
-
-
-def choose_settings():
-    level = ask_choice("\nChoose difficulty (easy/hard/tough): ", list(DIFFICULTY))
-    length = int(ask_choice("Choose word length (3/4/5/6): ", ["3", "4", "5", "6"]))
-    return level, length
-
-
-def main():
-    print("=" * 44)
-    print("          WORD SCRAMBLE GAME")
-    print("=" * 44)
-    if not GEMINI_API_KEY:
-        print("(Tip: set GEMINI_API_KEY to get Gemini clues in 'tough' mode)")
-
-    print("\nDifficulty levels:")
-    for name, rules in DIFFICULTY.items():
-        print(f"  {name:<6} - {rules['desc']}")
-    level, length = choose_settings()
-
-    used, score, rounds = set(), 0, 0
-    while True:
-        result = play_round(length, level, used)
-        if result is not None:
-            rounds += 1
-            score += 1 if result else 0
-        print(f"\nScore: {score}/{rounds}")
-
-        again = ask_choice("\nDo you want to play the next word? (y/n): ", ["y", "n", "yes", "no"])
-        if again.startswith("n"):
-            print(f"\nThanks for playing! Final score: {score}/{rounds}")
             break
-
-        change = ask_choice("Change difficulty or length? (y/n): ", ["y", "n", "yes", "no"])
-        if change.startswith("y"):
-            level, length = choose_settings()
-            used.clear()
+    return "".join(result)
 
 
-if __name__ == "__main__":
-    main()
+def init_state():
+    ss = st.session_state
+    ss.setdefault("game", None)
+    ss.setdefault("used", set())
+    ss.setdefault("score", 0)
+    ss.setdefault("rounds", 0)
+    ss.setdefault("error", "")
+
+
+def start_round():
+    ss = st.session_state
+    level, length = ss.level, int(ss.length)
+    ss.error = ""
+    try:
+        word, info = pick_word(length, ss.used)
+    except (requests.RequestException, ValueError) as e:
+        ss.game = None
+        ss.error = f"Could not reach the word list ({type(e).__name__}). Please try again."
+        return
+    if not word:
+        ss.game = None
+        ss.error = "Could not find a word. Please try again."
+        return
+    ss.used.add(word)
+    pos, definition = info
+    rules = DIFFICULTY[level]
+    ss.game = {
+        "word": word, "pos": pos, "definition": definition, "level": level,
+        "jumbled": scramble(word, rules["keep_first"]),
+        "tries_left": rules["tries"], "hint": None, "feedback": "", "status": "playing",
+    }
+
+
+def show_hint():
+    g = st.session_state.game
+    if g and g["hint"] is None:
+        clue = gemini_clue(g["word"], g["pos"], g["definition"]) if g["level"] == "tough" else None
+        g["hint"] = clue or f"({g['pos']}) {mask_word(g['definition'], g['word'])}"
+
+
+def submit_guess():
+    ss = st.session_state
+    g = ss.game
+    guess = (ss.get("guess_box") or "").strip().lower()
+    if not g or g["status"] != "playing" or not guess:
+        return
+    if guess == g["word"]:
+        g["status"] = "won"
+        ss.score += 1
+        ss.rounds += 1
+        return
+    g["tries_left"] -= 1
+    if g["tries_left"] <= 0:
+        g["status"] = "lost"
+        ss.rounds += 1
+    else:
+        n = g["tries_left"]
+        g["feedback"] = f"Wrong answer. {n} {'try' if n == 1 else 'tries'} left."
+
+
+# ---------------------------------------------------------------- the page
+init_state()
+
+st.title("🔤 Word Scramble")
+st.caption("Unscramble the letters to find the word.")
+
+c1, c2 = st.columns(2)
+c1.selectbox("Difficulty", list(DIFFICULTY), key="level")
+c2.selectbox("Word length", ["3", "4", "5", "6"], index=1, key="length")
+st.caption(DIFFICULTY[st.session_state.level]["desc"])
+if not get_gemini_key():
+    st.caption("Tip: add GEMINI_API_KEY in the app's Secrets to get Gemini clues in tough mode.")
+
+g = st.session_state.game
+
+if st.session_state.error:
+    st.error(st.session_state.error)
+
+if g is None:
+    st.button("Start game", on_click=start_round, type="primary")
+else:
+    st.markdown(f"### `{g['jumbled'].upper()}`")
+    st.write(f"{len(g['word'])} letters · {g['level']} mode")
+
+    if g["status"] == "playing":
+        st.write(f"Tries left: **{g['tries_left']}**")
+        with st.form("guess_form", clear_on_submit=True):
+            st.text_input("Your answer", key="guess_box")
+            st.form_submit_button("Submit", on_click=submit_guess, type="primary")
+        st.button("💡 Hint", on_click=show_hint)
+        if g["hint"]:
+            st.info(f"Hint: {g['hint']}")
+        if g["feedback"]:
+            st.warning(g["feedback"])
+    else:
+        if g["status"] == "won":
+            st.balloons()
+            st.success(f"🎉 Congratulations! **{g['word'].upper()}** is correct!")
+        else:
+            st.error(f"❌ Your answer is wrong. The right answer is **{g['word'].upper()}**.")
+        st.write(f"Meaning: ({g['pos']}) {g['definition']}")
+        st.button("Next word ➜", on_click=start_round, type="primary")
+
+st.divider()
+st.write(f"Score: **{st.session_state.score} / {st.session_state.rounds}**")
